@@ -68,11 +68,26 @@ func (s *SqliteStore) initTables() error {
 		return err
 	}
 
-	// Create l2_block_mappings table
+	// Create eth_locations table for ETH DA
+	_, err = s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS eth_locations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			tx_hash TEXT UNIQUE,
+			l2_start INTEGER,
+			l2_end INTEGER,
+			l1_block INTEGER
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	// Create l2_block_mappings table with da_type column
 	_, err = s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS l2_block_mappings (
 			l2_block_num INTEGER PRIMARY KEY,
 			location_id INTEGER,
+			da_type TEXT DEFAULT 'celestia',
 			FOREIGN KEY (location_id) REFERENCES celestia_locations(id)
 		)
 	`)
@@ -94,6 +109,15 @@ func (s *SqliteStore) initTables() error {
 	`)
 	// Ignore error if column already exists
 	if err != nil && err.Error() != "duplicate column name: l1_block" {
+		// Log but don't fail - column might already exist
+	}
+
+	// Add da_type column to l2_block_mappings if it doesn't exist (for existing databases)
+	_, err = s.db.Exec(`
+		ALTER TABLE l2_block_mappings ADD COLUMN da_type TEXT DEFAULT 'celestia'
+	`)
+	// Ignore error if column already exists
+	if err != nil && err.Error() != "duplicate column name: da_type" {
 		// Log but don't fail - column might already exist
 	}
 
@@ -166,8 +190,68 @@ func (s *SqliteStore) StoreLocation(location *CelestiaLocation) error {
 
 	// Store mapping for each L2 block in the range
 	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO l2_block_mappings (l2_block_num, location_id)
-		VALUES (?, ?)
+		INSERT OR REPLACE INTO l2_block_mappings (l2_block_num, location_id, da_type)
+		VALUES (?, ?, 'celestia')
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for blockNum := location.L2Range.Start; blockNum <= location.L2Range.End; blockNum++ {
+		_, err = stmt.Exec(blockNum, locationID)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// StoreEthLocation stores the Ethereum DA location for a range of L2 blocks
+func (s *SqliteStore) StoreEthLocation(location *EthereumLocation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Insert the location
+	result, err := tx.Exec(`
+		INSERT OR IGNORE INTO eth_locations
+		(tx_hash, l2_start, l2_end, l1_block)
+		VALUES (?, ?, ?, ?)
+	`, location.TxHash, location.L2Range.Start, location.L2Range.End, location.L1Block)
+	if err != nil {
+		return err
+	}
+
+	// Get the location ID
+	var locationID int64
+	if rowsAffected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if rowsAffected == 0 {
+		// Location already exists, get its ID
+		err = tx.QueryRow(`
+			SELECT id FROM eth_locations WHERE tx_hash = ?
+		`, location.TxHash).Scan(&locationID)
+		if err != nil {
+			return err
+		}
+	} else {
+		locationID, err = result.LastInsertId()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Store mapping for each L2 block in the range
+	stmt, err := tx.Prepare(`
+		INSERT OR REPLACE INTO l2_block_mappings (l2_block_num, location_id, da_type)
+		VALUES (?, ?, 'ethereum')
 	`)
 	if err != nil {
 		return err
@@ -215,6 +299,63 @@ func (s *SqliteStore) GetLocation(l2BlockNum uint64) (*CelestiaLocation, error) 
 
 	location.L2Range = L2Range{Start: start, End: end}
 	return &location, nil
+}
+
+// GetDALocation returns the DA location (either Celestia or Ethereum) for a given L2 block number
+func (s *SqliteStore) GetDALocation(l2BlockNum uint64) (DALocation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// First, check the da_type in l2_block_mappings
+	var daType string
+	var locationID int64
+	err := s.db.QueryRow(`
+		SELECT da_type, location_id FROM l2_block_mappings WHERE l2_block_num = ?
+	`, l2BlockNum).Scan(&daType, &locationID)
+	
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("location not found for block %d", l2BlockNum)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	switch daType {
+	case "celestia":
+		var location CelestiaLocation
+		var start, end uint64
+		err = s.db.QueryRow(`
+			SELECT commitment, height, l2_start, l2_end, l1_block
+			FROM celestia_locations WHERE id = ?
+		`, locationID).Scan(
+			&location.Commitment, &location.Height,
+			&start, &end, &location.L1Block,
+		)
+		if err != nil {
+			return nil, err
+		}
+		location.L2Range = L2Range{Start: start, End: end}
+		return &location, nil
+		
+	case "ethereum":
+		var location EthereumLocation
+		var start, end uint64
+		err = s.db.QueryRow(`
+			SELECT tx_hash, l2_start, l2_end, l1_block
+			FROM eth_locations WHERE id = ?
+		`, locationID).Scan(
+			&location.TxHash,
+			&start, &end, &location.L1Block,
+		)
+		if err != nil {
+			return nil, err
+		}
+		location.L2Range = L2Range{Start: start, End: end}
+		return &location, nil
+		
+	default:
+		return nil, fmt.Errorf("unknown DA type: %s", daType)
+	}
 }
 
 // GetLocationByCommitment returns the Celestia location for a given commitment

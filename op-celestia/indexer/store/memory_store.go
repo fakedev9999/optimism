@@ -6,18 +6,27 @@ import (
 	"sync"
 )
 
-// MemoryStore provides thread-safe storage for L2 block -> Celestia location mapping
+// MemoryStore provides thread-safe storage for L2 block -> DA location mapping
 type MemoryStore struct {
 	mu sync.RWMutex
 
 	// l2BlockToLocation maps L2 block number to its Celestia location
 	l2BlockToLocation map[uint64]*CelestiaLocation
 
+	// l2BlockToEthLocation maps L2 block number to its Ethereum DA location
+	l2BlockToEthLocation map[uint64]*EthereumLocation
+
+	// l2BlockDAType maps L2 block number to its DA type ("celestia" or "ethereum")
+	l2BlockDAType map[uint64]string
+
 	// lastIndexedBlock tracks the last L2 block that was indexed
 	lastIndexedBlock uint64
 
 	// commitmentToLocation maps Celestia commitment to location for quick lookup
 	commitmentToLocation map[string]*CelestiaLocation
+
+	// txHashToLocation maps Ethereum tx hash to location for quick lookup
+	txHashToLocation map[string]*EthereumLocation
 }
 
 var _ Store = (*MemoryStore)(nil)
@@ -26,7 +35,10 @@ var _ Store = (*MemoryStore)(nil)
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		l2BlockToLocation:    make(map[uint64]*CelestiaLocation),
+		l2BlockToEthLocation: make(map[uint64]*EthereumLocation),
+		l2BlockDAType:        make(map[uint64]string),
 		commitmentToLocation: make(map[string]*CelestiaLocation),
+		txHashToLocation:     make(map[string]*EthereumLocation),
 		lastIndexedBlock:     0,
 	}
 }
@@ -54,10 +66,27 @@ func (s *MemoryStore) StoreLocation(location *CelestiaLocation) error {
 	// Store mapping for each L2 block in the range
 	for blockNum := location.L2Range.Start; blockNum <= location.L2Range.End; blockNum++ {
 		s.l2BlockToLocation[blockNum] = location
+		s.l2BlockDAType[blockNum] = "celestia"
 	}
 
 	// Store commitment mapping
 	s.commitmentToLocation[location.Commitment] = location
+	return nil
+}
+
+// StoreEthLocation stores the Ethereum DA location for a range of L2 blocks
+func (s *MemoryStore) StoreEthLocation(location *EthereumLocation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Store mapping for each L2 block in the range
+	for blockNum := location.L2Range.Start; blockNum <= location.L2Range.End; blockNum++ {
+		s.l2BlockToEthLocation[blockNum] = location
+		s.l2BlockDAType[blockNum] = "ethereum"
+	}
+
+	// Store tx hash mapping
+	s.txHashToLocation[location.TxHash] = location
 	return nil
 }
 
@@ -71,6 +100,34 @@ func (s *MemoryStore) GetLocation(l2BlockNum uint64) (*CelestiaLocation, error) 
 		return nil, fmt.Errorf("location not found for block %d", l2BlockNum)
 	}
 	return location, nil
+}
+
+// GetDALocation returns the DA location (either Celestia or Ethereum) for a given L2 block number
+func (s *MemoryStore) GetDALocation(l2BlockNum uint64) (DALocation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	daType, exists := s.l2BlockDAType[l2BlockNum]
+	if !exists {
+		return nil, fmt.Errorf("location not found for block %d", l2BlockNum)
+	}
+
+	switch daType {
+	case "celestia":
+		location, exists := s.l2BlockToLocation[l2BlockNum]
+		if !exists {
+			return nil, fmt.Errorf("celestia location not found for block %d", l2BlockNum)
+		}
+		return location, nil
+	case "ethereum":
+		location, exists := s.l2BlockToEthLocation[l2BlockNum]
+		if !exists {
+			return nil, fmt.Errorf("ethereum location not found for block %d", l2BlockNum)
+		}
+		return location, nil
+	default:
+		return nil, fmt.Errorf("unknown DA type: %s", daType)
+	}
 }
 
 // GetLocationByCommitment returns the Celestia location for a given commitment
@@ -89,7 +146,8 @@ func (s *MemoryStore) GetLocationByCommitment(commitment string) (*CelestiaLocat
 func (s *MemoryStore) GetIndexedBlockCount() (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.l2BlockToLocation), nil
+	// Return total count of indexed blocks across both DA types
+	return len(s.l2BlockDAType), nil
 }
 
 // GetAllLocations returns all stored locations (useful for debugging/admin)
@@ -116,7 +174,10 @@ func (s *MemoryStore) Clear() error {
 	defer s.mu.Unlock()
 
 	s.l2BlockToLocation = make(map[uint64]*CelestiaLocation)
+	s.l2BlockToEthLocation = make(map[uint64]*EthereumLocation)
+	s.l2BlockDAType = make(map[uint64]string)
 	s.commitmentToLocation = make(map[string]*CelestiaLocation)
+	s.txHashToLocation = make(map[string]*EthereumLocation)
 	s.lastIndexedBlock = 0
 	return nil
 }
@@ -127,9 +188,12 @@ func (s *MemoryStore) String() string {
 	defer s.mu.RUnlock()
 
 	state := map[string]any{
-		"last_indexed_block": s.lastIndexedBlock,
-		"indexed_blocks":     len(s.l2BlockToLocation),
-		"unique_locations":   len(s.commitmentToLocation),
+		"last_indexed_block":      s.lastIndexedBlock,
+		"total_indexed_blocks":    len(s.l2BlockDAType),
+		"celestia_blocks":         len(s.l2BlockToLocation),
+		"ethereum_blocks":         len(s.l2BlockToEthLocation),
+		"unique_celestia_locations": len(s.commitmentToLocation),
+		"unique_eth_locations":      len(s.txHashToLocation),
 	}
 
 	data, err := json.MarshalIndent(state, "", "  ")

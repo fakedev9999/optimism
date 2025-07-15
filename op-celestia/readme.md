@@ -1,21 +1,38 @@
 # op-celestia-indexer
 
-The `op-celestia-indexer` is a service that indexes L2 block locations on the
-Celestia Data Availability (DA) layer. It tracks where L2 blocks are stored on
-Celestia by parsing batch transactions and maintaining a mapping between L2
-block numbers and their corresponding Celestia locations.
+The `op-celestia-indexer` is a service that indexes L2 block locations on both
+Celestia DA and Ethereum DA (standard calldata). It tracks where L2 blocks are 
+stored by parsing batch transactions and maintaining a mapping between L2 block 
+numbers and their corresponding DA locations.
 
 ## Overview
 
-When using Celestia as the DA layer for Optimism, L2 batch data (frames) are posted to Celestia instead of being included as calldata in L1 transactions. Instead, L1 transactions contain a 40-byte reference:
-- 1 byte version marker (`0xce`)
+The indexer supports both DA types and determines which one to use based on the
+frame version byte in batch transactions:
+
+### Celestia DA
+When using Celestia as the DA layer, L2 batch data (frames) are posted to 
+Celestia instead of being included as calldata in L1 transactions. L1 
+transactions contain:
+- Frame version byte `0x01` (OP Stack Alt-DA format)
+- Commitment type byte
+- DA layer byte `0x0c` (Celestia identifier)
 - 8 bytes Celestia block height (little-endian)
 - 32 bytes commitment hash
 
-The indexer service monitors L1 batch inbox transactions for Celestia references,
-fetches the corresponding frame data from Celestia, parses frames to determine
-which L2 blocks they contain, maintains an index mapping L2 block numbers to
-Celestia locations, and provides an RPC API to query L2 block locations.
+### Ethereum DA
+When using standard Ethereum DA, L2 batch data is included as calldata in L1
+transactions with:
+- Frame version byte `0x00` (standard OP Stack format)
+- Frame data directly in calldata
+
+The indexer service:
+- Monitors L1 batch inbox transactions
+- Checks frame version byte to determine DA type
+- Fetches frame data from Celestia or parses L1 calldata
+- Parses frames to determine which L2 blocks they contain
+- Maintains an index mapping L2 block numbers to DA locations
+- Provides RPC APIs to query L2 block locations for both DA types
 
 ## CLI Flags
 
@@ -48,9 +65,58 @@ Celestia locations, and provides an RPC API to query L2 block locations.
 
 ## API Usage
 
-### Get Celestia Location
+### Get DA Location
 
-Query the Celestia location for a specific L2 block:
+Query the DA location for a specific L2 block (works with both Celestia and Ethereum DA):
+
+```bash
+curl -X POST -H "Content-Type: application/json" -s \
+  --data '{"jsonrpc":"2.0","method":"admin_getDALocation","params":[355],"id":1}' \
+  http://localhost:57220 | jq .
+```
+
+Response for Celestia DA:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "type": "celestia",
+    "data": {
+      "height": 353,
+      "commitment": "YQEAAAAAAADg6goIrTykl5jyHlGz6Bl2tYTDYzffUY39g3inPvMGDQ==",
+      "l2_range": {
+        "start": 354,
+        "end": 359
+      },
+      "l1_block": 12345
+    }
+  }
+}
+```
+
+Response for Ethereum DA:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "type": "ethereum",
+    "data": {
+      "tx_hash": "0x123...",
+      "l2_range": {
+        "start": 354,
+        "end": 359
+      },
+      "l1_block": 12345
+    }
+  }
+}
+```
+
+### Get Celestia Location (Legacy)
+
+Query the Celestia location for a specific L2 block (backward compatibility):
 
 ```bash
 curl -X POST -H "Content-Type: application/json" -s \
@@ -74,6 +140,8 @@ Response:
   }
 }
 ```
+
+**Note:** This endpoint only returns Celestia DA locations. For Ethereum DA blocks, it will return an error. Use `admin_getDALocation` for both DA types.
 
 ### Get Indexer Status
 
@@ -125,3 +193,15 @@ Clean build artifacts:
 ```bash
 just clean
 ```
+
+## Migration Notes
+
+### Upgrading from Celestia-only version
+
+The indexer now supports both Celestia DA and Ethereum DA. Existing deployments will continue to work without changes. The database schema is updated to support both DA types:
+
+1. New `eth_locations` table is created for Ethereum DA locations
+2. `l2_block_mappings` table gets a new `da_type` column (defaults to 'celestia' for existing entries)
+3. Existing Celestia-only data remains unchanged and accessible
+
+The `admin_getCelestiaLocation` RPC endpoint continues to work for backward compatibility but only returns Celestia DA locations. Use the new `admin_getDALocation` endpoint to query both DA types.
