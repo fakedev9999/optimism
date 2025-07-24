@@ -11,6 +11,7 @@ on:
     branches:
       - celestia-develop
       - test/github-actions
+      - taehoon/eth-da-support-tmp
   pull_request:
     branches:
       - celestia-develop
