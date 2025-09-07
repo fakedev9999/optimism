@@ -200,7 +200,10 @@ contract GasPriceOracle is ISemver {
         }
 
         return Arithmetic.saturatingAdd(
-            Arithmetic.saturatingMul(_gasUsed, IL1Block(Predeploys.L1_BLOCK_ATTRIBUTES).operatorFeeScalar()) / 1e6,
+            Arithmetic.saturatingMul(
+                Arithmetic.saturatingMul(_gasUsed, IL1Block(Predeploys.L1_BLOCK_ATTRIBUTES).operatorFeeScalar()),
+                10
+            ),
             IL1Block(Predeploys.L1_BLOCK_ATTRIBUTES).operatorFeeConstant()
         );
     }
