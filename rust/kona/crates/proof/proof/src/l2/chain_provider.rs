@@ -224,10 +224,38 @@ impl<T: CommsClient + Send + Sync> L2ChainProvider for OracleL2ChainProvider<T> 
         number: u64,
         rollup_config: Arc<RollupConfig>,
     ) -> Result<SystemConfig, <Self as L2ChainProvider>::Error> {
-        // Get the block at the given number.
-        let block = self.block_by_number(number).await?;
+        let header @ Header { transactions_root, timestamp, .. } =
+            self.header_by_number(number).await?;
+        let header_hash = header.hash_slow();
 
-        // Construct the system config from the payload.
+        let transactions = if header.number == rollup_config.genesis.l2.number {
+            Vec::new()
+        } else {
+            match self.first_transaction_rlp(transactions_root, header_hash).await? {
+                Some(rlp) => {
+                    let mut transactions = Vec::with_capacity(1);
+                    transactions.push(
+                        OpTxEnvelope::decode_2718(&mut rlp.as_ref())
+                            .map_err(FromBlockError::from)
+                            .map_err(OracleProviderError::BlockInfo)?,
+                    );
+                    transactions
+                }
+                None => Vec::new(),
+            }
+        };
+
+        let block = OpBlock {
+            header,
+            body: BlockBody {
+                transactions,
+                ommers: Vec::new(),
+                withdrawals: rollup_config
+                    .is_canyon_active(timestamp)
+                    .then(|| alloy_eips::eip4895::Withdrawals::new(Vec::new())),
+            },
+        };
+
         to_system_config(&block, rollup_config.as_ref())
             .map_err(OracleProviderError::OpBlockConversion)
     }
@@ -407,7 +435,8 @@ mod tests {
     ) -> (OracleL2ChainProvider<MockOracle>, Arc<AtomicUsize>) {
         let mut tx_trie = ordered_trie_with_encoder(txs, |tx, buf| tx.encode_2718(buf));
         let transactions_root = tx_trie.root();
-        let header = Header { number: 42, transactions_root, ..Default::default() };
+        let header =
+            Header { number: 42, gas_limit: 30_000_000, transactions_root, ..Default::default() };
 
         let mut preimages = tx_trie.take_proof_nodes().into_inner().into_iter().fold(
             BTreeMap::new(),
@@ -457,6 +486,27 @@ mod tests {
         assert!(
             fast_gets < full_gets,
             "l2_block_info_by_number should not hydrate the full transaction trie"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_config_by_number_reads_only_first_transaction_path() {
+        let txs = vec![deposit_tx(11, 7), deposit_tx(12, 8), deposit_tx(13, 9), deposit_tx(14, 10)];
+
+        let (mut fast_provider, fast_calls) = provider_with_block(&txs);
+        let rollup_config = Arc::clone(&fast_provider.rollup_config);
+        let config = fast_provider.system_config_by_number(42, rollup_config).await.unwrap();
+        let fast_gets = fast_calls.load(Ordering::SeqCst);
+
+        let (mut full_provider, full_calls) = provider_with_block(&txs);
+        full_provider.block_by_number(42).await.unwrap();
+        let full_gets = full_calls.load(Ordering::SeqCst);
+
+        assert_eq!(config.batcher_address, Address::ZERO);
+        assert_eq!(config.gas_limit, 30_000_000);
+        assert!(
+            fast_gets < full_gets,
+            "system_config_by_number should not hydrate the full transaction trie"
         );
     }
 }
