@@ -55,24 +55,20 @@ where
         let channel_timeout = self.rollup_config.channel_timeout(l2_safe_head.block_info.timestamp);
 
         let mut current = l2_safe_head;
-        loop {
-            let before_l2_genesis =
-                current.block_info.number <= self.rollup_config.genesis.l2.number;
-            let before_l1_genesis =
-                current.l1_origin.number <= self.rollup_config.genesis.l1.number;
-            let before_channel_timeout =
-                current.l1_origin.number + channel_timeout <= l1_origin_number;
-            if before_l2_genesis || before_l1_genesis || before_channel_timeout {
-                break;
-            }
+        while !self.initial_reset_walk_complete(&current, l1_origin_number, channel_timeout) {
+            // All blocks with the same L1 origin have the same stop predicate. `seq_num` is the
+            // zero-based L2 block index within the current L1 origin, so jump directly to the last
+            // block of the previous L1 origin instead of checking every same-origin L2 block.
+            let previous_number = current
+                .block_info
+                .number
+                .saturating_sub(current.seq_num.saturating_add(1))
+                .max(self.rollup_config.genesis.l2.number);
 
-            current = self
-                .l2_chain_provider
-                .l2_block_info_by_number(current.block_info.number - 1)
-                .await
-                .map_err(|e| {
-                    PipelineError::Provider(alloc::string::ToString::to_string(&e)).temp()
-                })?;
+            current =
+                self.l2_chain_provider.l2_block_info_by_number(previous_number).await.map_err(
+                    |e| PipelineError::Provider(alloc::string::ToString::to_string(&e)).temp(),
+                )?;
         }
 
         let system_config = self
@@ -82,6 +78,18 @@ where
             .map_err(|e| PipelineError::Provider(alloc::string::ToString::to_string(&e)).temp())?;
 
         Ok((current.l1_origin, system_config))
+    }
+
+    fn initial_reset_walk_complete(
+        &self,
+        current: &L2BlockInfo,
+        l1_origin_number: u64,
+        channel_timeout: u64,
+    ) -> bool {
+        let before_l2_genesis = current.block_info.number <= self.rollup_config.genesis.l2.number;
+        let before_l1_genesis = current.l1_origin.number <= self.rollup_config.genesis.l1.number;
+        let before_channel_timeout = current.l1_origin.number + channel_timeout <= l1_origin_number;
+        before_l2_genesis || before_l1_genesis || before_channel_timeout
     }
 }
 
@@ -403,13 +411,13 @@ mod tests {
         let rollup_config = RollupConfig { channel_timeout: 10, ..Default::default() };
 
         let mut l2_chain_provider = TestL2ChainProvider::default();
-        // L2 blocks 89..=100: block N has L1 origin (N - 50).
+        // L2 blocks 0..=100: block N has L1 origin saturating at (N - 50).
         // Safe head at block 100, L1 origin 50.
         // Walkback: block 90 has L1 origin 40. 40 + 10 = 50, NOT > 50, so walkback stops.
-        for n in 89u64..=100 {
+        for n in 0u64..=100 {
             l2_chain_provider.blocks.push(L2BlockInfo {
                 block_info: BlockInfo { number: n, ..Default::default() },
-                l1_origin: BlockNumHash { number: n - 50, ..Default::default() },
+                l1_origin: BlockNumHash { number: n.saturating_sub(50), ..Default::default() },
                 seq_num: 0,
             });
         }
@@ -501,5 +509,39 @@ mod tests {
         let (l1_origin, sys_cfg) = pipeline.initial_reset(L2BlockInfo::default()).await.unwrap();
         assert_eq!(l1_origin.number, 0);
         assert_eq!(sys_cfg, SystemConfig::default());
+    }
+
+    #[tokio::test]
+    async fn test_initial_reset_uses_sequence_number_to_skip_same_origin() {
+        use alloy_primitives::address;
+
+        let rollup_config = RollupConfig { channel_timeout: 1, ..Default::default() };
+        let mut l2_chain_provider = TestL2ChainProvider::default();
+        l2_chain_provider.blocks.push(L2BlockInfo {
+            block_info: BlockInfo { number: 90, ..Default::default() },
+            l1_origin: BlockNumHash { number: 49, ..Default::default() },
+            seq_num: 4,
+        });
+        l2_chain_provider.system_configs.insert(
+            90,
+            SystemConfig {
+                batcher_address: address!("000000000000000000000000000000000000aaaa"),
+                ..Default::default()
+            },
+        );
+
+        let rollup_config = Arc::new(rollup_config);
+        let attributes = TestNextAttributes::default();
+        let mut pipeline = DerivationPipeline::new(attributes, rollup_config, l2_chain_provider);
+
+        let l2_safe_head = L2BlockInfo {
+            block_info: BlockInfo { number: 100, ..Default::default() },
+            l1_origin: BlockNumHash { number: 50, ..Default::default() },
+            seq_num: 9,
+        };
+
+        let (l1_origin, sys_cfg) = pipeline.initial_reset(l2_safe_head).await.unwrap();
+        assert_eq!(l1_origin.number, 49);
+        assert_eq!(sys_cfg.batcher_address, address!("000000000000000000000000000000000000aaaa"));
     }
 }

@@ -2,18 +2,21 @@
 
 use crate::{HintType, eip2935::eip_2935_history_lookup, errors::OracleProviderError};
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use alloy_consensus::{BlockBody, Header};
+use alloy_consensus::{BlockBody, Header, Transaction, Typed2718};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{Address, B256, Bytes};
-use alloy_rlp::Decodable;
+use alloy_rlp::{Decodable, Encodable};
 use async_trait::async_trait;
 use kona_derive::L2ChainProvider;
 use kona_driver::PipelineCursor;
 use kona_executor::TrieDBProvider;
 use kona_genesis::{RollupConfig, SystemConfig};
-use kona_mpt::{OrderedListWalker, TrieHinter, TrieNode, TrieProvider};
+use kona_mpt::{Nibbles, OrderedListWalker, TrieHinter, TrieNode, TrieProvider};
 use kona_preimage::{CommsClient, PreimageKey, PreimageKeyType};
-use kona_protocol::{BatchValidationProvider, L2BlockInfo, to_system_config};
+use kona_protocol::{
+    BatchValidationProvider, BlockInfo, FromBlockError, L1BlockInfoTx, L2BlockInfo,
+    to_system_config,
+};
 use op_alloy_consensus::{OpBlock, OpTxEnvelope};
 use spin::RwLock;
 
@@ -58,6 +61,38 @@ impl<T: CommsClient> OracleL2ChainProvider<T> {
 }
 
 impl<T: CommsClient> OracleL2ChainProvider<T> {
+    fn block_info_from_header(header: &Header) -> BlockInfo {
+        BlockInfo {
+            hash: header.hash_slow(),
+            number: header.number,
+            parent_hash: header.parent_hash,
+            timestamp: header.timestamp,
+        }
+    }
+
+    async fn first_transaction_rlp(
+        &self,
+        transactions_root: B256,
+        header_hash: B256,
+    ) -> Result<Option<Bytes>, OracleProviderError> {
+        HintType::L2Transactions
+            .with_data(&[header_hash.as_ref()])
+            .with_data(self.chain_id.map_or_else(Vec::new, |id| id.to_be_bytes().to_vec()))
+            .send(self.oracle.as_ref())
+            .await?;
+
+        let mut trie = TrieNode::new_blinded(transactions_root);
+        // The ordered trie stores logical transaction 0 under RLP(0). The full-list walker
+        // compensates by moving this final leaf to the front after hydrating all leaves.
+        let mut encoded_index = Vec::new();
+        0usize.encode(&mut encoded_index);
+        if let Some(tx) = trie.open(&Nibbles::unpack(&encoded_index), self)? {
+            return Ok(Some(tx.clone()));
+        }
+
+        Ok(None)
+    }
+
     /// Returns a [Header] corresponding to the given L2 block number, by walking back from the
     /// L2 safe head.
     async fn header_by_number(&self, block_number: u64) -> Result<Header, OracleProviderError> {
@@ -107,12 +142,37 @@ impl<T: CommsClient + Send + Sync> BatchValidationProvider for OracleL2ChainProv
     type Error = OracleProviderError;
 
     async fn l2_block_info_by_number(&mut self, number: u64) -> Result<L2BlockInfo, Self::Error> {
-        // Get the block at the given number.
-        let block = self.block_by_number(number).await?;
+        let header @ Header { transactions_root, .. } = self.header_by_number(number).await?;
+        let block_info = Self::block_info_from_header(&header);
 
-        // Construct the system config from the payload.
-        L2BlockInfo::from_block_and_genesis(&block, &self.rollup_config.genesis)
-            .map_err(OracleProviderError::BlockInfo)
+        if block_info.number == self.rollup_config.genesis.l2.number {
+            if block_info.hash != self.rollup_config.genesis.l2.hash {
+                return Err(OracleProviderError::BlockInfo(FromBlockError::InvalidGenesisHash));
+            }
+            return Ok(L2BlockInfo::new(block_info, self.rollup_config.genesis.l1, 0));
+        }
+
+        let first_tx_rlp = self
+            .first_transaction_rlp(transactions_root, block_info.hash)
+            .await?
+            .ok_or_else(|| {
+                OracleProviderError::BlockInfo(FromBlockError::MissingL1InfoDeposit(
+                    block_info.hash,
+                ))
+            })?;
+        let first_tx = OpTxEnvelope::decode_2718(&mut first_tx_rlp.as_ref())
+            .map_err(FromBlockError::from)
+            .map_err(OracleProviderError::BlockInfo)?;
+        let Some(deposit) = first_tx.as_deposit() else {
+            return Err(OracleProviderError::BlockInfo(FromBlockError::FirstTxNonDeposit(
+                first_tx.ty(),
+            )));
+        };
+
+        let l1_info = L1BlockInfoTx::decode_calldata(deposit.input().as_ref())
+            .map_err(FromBlockError::BlockInfoDecodeError)
+            .map_err(OracleProviderError::BlockInfo)?;
+        Ok(L2BlockInfo::new(block_info, l1_info.id(), l1_info.sequence_number()))
     }
 
     async fn block_by_number(&mut self, number: u64) -> Result<OpBlock, Self::Error> {
@@ -164,10 +224,38 @@ impl<T: CommsClient + Send + Sync> L2ChainProvider for OracleL2ChainProvider<T> 
         number: u64,
         rollup_config: Arc<RollupConfig>,
     ) -> Result<SystemConfig, <Self as L2ChainProvider>::Error> {
-        // Get the block at the given number.
-        let block = self.block_by_number(number).await?;
+        let header @ Header { transactions_root, timestamp, .. } =
+            self.header_by_number(number).await?;
+        let header_hash = header.hash_slow();
 
-        // Construct the system config from the payload.
+        let transactions = if header.number == rollup_config.genesis.l2.number {
+            Vec::new()
+        } else {
+            match self.first_transaction_rlp(transactions_root, header_hash).await? {
+                Some(rlp) => {
+                    let mut transactions = Vec::with_capacity(1);
+                    transactions.push(
+                        OpTxEnvelope::decode_2718(&mut rlp.as_ref())
+                            .map_err(FromBlockError::from)
+                            .map_err(OracleProviderError::BlockInfo)?,
+                    );
+                    transactions
+                }
+                None => Vec::new(),
+            }
+        };
+
+        let block = OpBlock {
+            header,
+            body: BlockBody {
+                transactions,
+                ommers: Vec::new(),
+                withdrawals: rollup_config
+                    .is_canyon_active(timestamp)
+                    .then(|| alloy_eips::eip4895::Withdrawals::new(Vec::new())),
+            },
+        };
+
         to_system_config(&block, rollup_config.as_ref())
             .map_err(OracleProviderError::OpBlockConversion)
     }
@@ -282,5 +370,143 @@ impl<T: CommsClient> TrieHinter for OracleL2ChainProvider<T> {
                 .send(self.oracle.as_ref())
                 .await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::{collections::BTreeMap, vec, vec::Vec};
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_primitives::{Address, Sealed, U256, keccak256};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use kona_genesis::ChainGenesis;
+    use kona_mpt::ordered_trie_with_encoder;
+    use kona_preimage::{HintWriterClient, PreimageOracleClient, errors::PreimageOracleResult};
+    use kona_protocol::{L1BlockInfoBedrock, L1BlockInfoTx};
+    use op_alloy_consensus::TxDeposit;
+
+    #[derive(Clone, Default)]
+    struct MockOracle {
+        preimages: Arc<BTreeMap<PreimageKey, Vec<u8>>>,
+        get_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PreimageOracleClient for MockOracle {
+        async fn get(&self, key: PreimageKey) -> PreimageOracleResult<Vec<u8>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.preimages.get(&key).expect("missing preimage in mock").clone())
+        }
+
+        async fn get_exact(&self, key: PreimageKey, buf: &mut [u8]) -> PreimageOracleResult<()> {
+            let value = self.get(key).await?;
+            buf.copy_from_slice(&value);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl HintWriterClient for MockOracle {
+        async fn write(&self, _hint: &str) -> PreimageOracleResult<()> {
+            Ok(())
+        }
+    }
+
+    fn deposit_tx(l1_number: u64, seq_num: u64) -> OpTxEnvelope {
+        let l1_info = L1BlockInfoTx::Bedrock(L1BlockInfoBedrock::new(
+            l1_number,
+            1_000 + l1_number,
+            1,
+            B256::from([l1_number as u8; 32]),
+            seq_num,
+            Address::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+        ));
+        OpTxEnvelope::Deposit(Sealed::new(TxDeposit {
+            input: l1_info.encode_calldata(),
+            ..Default::default()
+        }))
+    }
+
+    fn provider_with_block(
+        txs: &[OpTxEnvelope],
+    ) -> (OracleL2ChainProvider<MockOracle>, Arc<AtomicUsize>) {
+        let mut tx_trie = ordered_trie_with_encoder(txs, |tx, buf| tx.encode_2718(buf));
+        let transactions_root = tx_trie.root();
+        let header =
+            Header { number: 42, gas_limit: 30_000_000, transactions_root, ..Default::default() };
+
+        let mut preimages = tx_trie.take_proof_nodes().into_inner().into_iter().fold(
+            BTreeMap::new(),
+            |mut acc, (_, value)| {
+                acc.insert(
+                    PreimageKey::new(*keccak256(value.as_ref()), PreimageKeyType::Keccak256),
+                    value.to_vec(),
+                );
+                acc
+            },
+        );
+
+        let mut header_rlp = Vec::new();
+        header.encode(&mut header_rlp);
+        let l2_head = header.hash_slow();
+        preimages.insert(PreimageKey::new(*l2_head, PreimageKeyType::Keccak256), header_rlp);
+
+        let oracle =
+            MockOracle { preimages: Arc::new(preimages), get_calls: Arc::new(AtomicUsize::new(0)) };
+        let calls = Arc::clone(&oracle.get_calls);
+        let rollup_config = Arc::new(RollupConfig {
+            genesis: ChainGenesis {
+                l2: alloy_eips::BlockNumHash { number: 0, ..Default::default() },
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        (OracleL2ChainProvider::new(l2_head, rollup_config, Arc::new(oracle)), calls)
+    }
+
+    #[tokio::test]
+    async fn l2_block_info_by_number_reads_only_first_transaction_path() {
+        let txs = vec![deposit_tx(11, 7), deposit_tx(12, 8), deposit_tx(13, 9), deposit_tx(14, 10)];
+
+        let (mut fast_provider, fast_calls) = provider_with_block(&txs);
+        let info = fast_provider.l2_block_info_by_number(42).await.unwrap();
+        let fast_gets = fast_calls.load(Ordering::SeqCst);
+
+        let (mut full_provider, full_calls) = provider_with_block(&txs);
+        full_provider.block_by_number(42).await.unwrap();
+        let full_gets = full_calls.load(Ordering::SeqCst);
+
+        assert_eq!(info.block_info.number, 42);
+        assert_eq!(info.l1_origin.number, 11);
+        assert_eq!(info.seq_num, 7);
+        assert!(
+            fast_gets < full_gets,
+            "l2_block_info_by_number should not hydrate the full transaction trie"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_config_by_number_reads_only_first_transaction_path() {
+        let txs = vec![deposit_tx(11, 7), deposit_tx(12, 8), deposit_tx(13, 9), deposit_tx(14, 10)];
+
+        let (mut fast_provider, fast_calls) = provider_with_block(&txs);
+        let rollup_config = Arc::clone(&fast_provider.rollup_config);
+        let config = fast_provider.system_config_by_number(42, rollup_config).await.unwrap();
+        let fast_gets = fast_calls.load(Ordering::SeqCst);
+
+        let (mut full_provider, full_calls) = provider_with_block(&txs);
+        full_provider.block_by_number(42).await.unwrap();
+        let full_gets = full_calls.load(Ordering::SeqCst);
+
+        assert_eq!(config.batcher_address, Address::ZERO);
+        assert_eq!(config.gas_limit, 30_000_000);
+        assert!(
+            fast_gets < full_gets,
+            "system_config_by_number should not hydrate the full transaction trie"
+        );
     }
 }
