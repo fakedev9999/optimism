@@ -55,24 +55,55 @@ where
         let channel_timeout = self.rollup_config.channel_timeout(l2_safe_head.block_info.timestamp);
 
         let mut current = l2_safe_head;
-        loop {
-            let before_l2_genesis =
-                current.block_info.number <= self.rollup_config.genesis.l2.number;
-            let before_l1_genesis =
-                current.l1_origin.number <= self.rollup_config.genesis.l1.number;
-            let before_channel_timeout =
-                current.l1_origin.number + channel_timeout <= l1_origin_number;
-            if before_l2_genesis || before_l1_genesis || before_channel_timeout {
-                break;
+        if !self.initial_reset_walk_complete(&current, l1_origin_number, channel_timeout) {
+            let mut low = self.rollup_config.genesis.l2.number;
+            let mut high = current.block_info.number - 1;
+            let mut found = None;
+
+            // L2 block L1 origins are monotonically non-decreasing on a valid OP chain, so the
+            // walkback stop predicate is true for an early prefix and false near the safe head.
+            // Find the highest block where the linear walk would stop.
+            while low <= high {
+                let mid = low + (high - low) / 2;
+                let candidate =
+                    self.l2_chain_provider.l2_block_info_by_number(mid).await.map_err(|e| {
+                        PipelineError::Provider(alloc::string::ToString::to_string(&e)).temp()
+                    })?;
+
+                if self.initial_reset_walk_complete(&candidate, l1_origin_number, channel_timeout) {
+                    found = Some(candidate);
+                    low = mid + 1;
+                } else if mid == 0 {
+                    break;
+                } else {
+                    high = mid - 1;
+                }
             }
 
-            current = self
-                .l2_chain_provider
-                .l2_block_info_by_number(current.block_info.number - 1)
-                .await
-                .map_err(|e| {
-                    PipelineError::Provider(alloc::string::ToString::to_string(&e)).temp()
-                })?;
+            current = found.ok_or_else(|| {
+                PipelineError::Provider(alloc::string::String::from(
+                    "Failed to find pipeline reset walkback boundary",
+                ))
+                .temp()
+            })?;
+
+            if current.block_info.number < l2_safe_head.block_info.number {
+                let next_number = current.block_info.number + 1;
+                let next = if next_number == l2_safe_head.block_info.number {
+                    l2_safe_head
+                } else {
+                    self.l2_chain_provider.l2_block_info_by_number(next_number).await.map_err(
+                        |e| PipelineError::Provider(alloc::string::ToString::to_string(&e)).temp(),
+                    )?
+                };
+
+                if self.initial_reset_walk_complete(&next, l1_origin_number, channel_timeout) {
+                    return Err(PipelineError::Provider(alloc::string::String::from(
+                        "Invalid pipeline reset walkback boundary",
+                    ))
+                    .temp());
+                }
+            }
         }
 
         let system_config = self
@@ -82,6 +113,18 @@ where
             .map_err(|e| PipelineError::Provider(alloc::string::ToString::to_string(&e)).temp())?;
 
         Ok((current.l1_origin, system_config))
+    }
+
+    fn initial_reset_walk_complete(
+        &self,
+        current: &L2BlockInfo,
+        l1_origin_number: u64,
+        channel_timeout: u64,
+    ) -> bool {
+        let before_l2_genesis = current.block_info.number <= self.rollup_config.genesis.l2.number;
+        let before_l1_genesis = current.l1_origin.number <= self.rollup_config.genesis.l1.number;
+        let before_channel_timeout = current.l1_origin.number + channel_timeout <= l1_origin_number;
+        before_l2_genesis || before_l1_genesis || before_channel_timeout
     }
 }
 
@@ -403,13 +446,13 @@ mod tests {
         let rollup_config = RollupConfig { channel_timeout: 10, ..Default::default() };
 
         let mut l2_chain_provider = TestL2ChainProvider::default();
-        // L2 blocks 89..=100: block N has L1 origin (N - 50).
+        // L2 blocks 0..=100: block N has L1 origin saturating at (N - 50).
         // Safe head at block 100, L1 origin 50.
         // Walkback: block 90 has L1 origin 40. 40 + 10 = 50, NOT > 50, so walkback stops.
-        for n in 89u64..=100 {
+        for n in 0u64..=100 {
             l2_chain_provider.blocks.push(L2BlockInfo {
                 block_info: BlockInfo { number: n, ..Default::default() },
-                l1_origin: BlockNumHash { number: n - 50, ..Default::default() },
+                l1_origin: BlockNumHash { number: n.saturating_sub(50), ..Default::default() },
                 seq_num: 0,
             });
         }
